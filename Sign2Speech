@@ -1,0 +1,816 @@
+import customtkinter as ctk
+import cv2
+import mediapipe as mp
+import pyttsx3
+from PIL import Image, ImageTk, ImageDraw
+import math
+import threading
+import time
+from datetime import datetime
+import webbrowser
+
+# ------------------ GLOBAL INITIALIZATIONS ------------------
+# Text-to-speech engine
+engine = pyttsx3.init()
+
+# Motion tracking history for gestures like 'J' and 'Z'
+motion_history = {'J': [], 'Z': []}
+
+def track_motion(letter, position):
+    """Track the motion of a specific letter gesture."""
+    if letter in motion_history:
+        motion_history[letter].append(position)
+        if len(motion_history[letter]) > 20:  # Limit history size
+            motion_history[letter].pop(0)
+
+def detect_j_motion():
+    """Detect if the motion history matches the 'J' gesture."""
+    if len(motion_history['J']) < 5:
+        return False
+    # Example logic: Check if motion forms a 'J' shape
+    x_positions = [pos[0] for pos in motion_history['J']]
+    y_positions = [pos[1] for pos in motion_history['J']]
+    return max(x_positions) - min(x_positions) > 0.1 and max(y_positions) - min(y_positions) > 0.1
+
+def detect_z_motion():
+    """Detect if the motion history matches the 'Z' gesture."""
+    if len(motion_history['Z']) < 5:
+        return False
+    # Example logic: Check if motion forms a 'Z' shape
+    x_positions = [pos[0] for pos in motion_history['Z']]
+    y_positions = [pos[1] for pos in motion_history['Z']]
+    return max(x_positions) - min(x_positions) > 0.1 and max(y_positions) - min(y_positions) > 0.1
+
+def is_finger_sideways(base, tip):
+    """Check if a finger is pointing sideways."""
+    return abs(base.y - tip.y) < abs(base.x - tip.x)
+
+def is_finger_pointing_down(base, tip):
+    """Check if a finger is pointing downwards."""
+    return tip.y > base.y
+engine.setProperty('rate', 130)
+
+# Open camera
+cap = cv2.VideoCapture(0)
+camera_active = False
+
+# Mediapipe Hands initialization
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+mp_draw = mp.solutions.drawing_utils
+
+# Global state variables
+prev_spoken = ""
+gesture_history = []
+word_stream = ""
+last_spoken_time = 0
+
+# Icon mapping for display (A-Z)
+icon_map = {chr(i): chr(i) for i in range(65, 91)}
+
+# Hotkey mappings
+HOTKEYS = {
+    'p': "✌️ PEACE ✌️",
+    'h': "HELLO WORLD",
+    'l': "LOVE FROM OINK",
+    'c': "COOL SIGN LANGUAGE!"
+}
+
+# ------------------ UTILITY FUNCTIONS ------------------
+def _speak_worker(text):
+    engine.say(text)
+    engine.runAndWait()
+
+def speak(text):
+    """
+    Speak the given text (if not repeated too soon), update gesture history, and add to word stream.
+    """
+    global prev_spoken, last_spoken_time, word_stream
+    now = time.time()
+    if text != prev_spoken and (now - last_spoken_time) > 2:
+        threading.Thread(target=_speak_worker, args=(text,), daemon=True).start()
+        prev_spoken = text
+        last_spoken_time = now
+        # Add a time-stamped record to gesture history (only nonempty gestures)
+        gesture_history.insert(0, f"{datetime.now().strftime('%H:%M:%S')} - {text.strip()}")
+        update_history()
+        # For "Open Palm" (or a space) add a space; otherwise add the letter
+        if text == "Open Palm":
+            word_stream += " "
+        else:
+            word_stream += text
+        # Show AI simulation when speaking
+        show_ai_simulation(text)
+
+def show_ai_simulation(text):
+    """Show AI simulation animation when text is being spoken"""
+    ai_label.configure(text="AI Speaking: " + text, text_color="#00ffcc")
+    ai_label.after(2000, lambda: ai_label.configure(text="AI Ready", text_color="#4dff4d"))
+
+def get_distance(p1, p2):
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+def get_finger_states(landmarks):
+    fingers = [1 if landmarks[4].x < landmarks[3].x else 0]
+    for tip, pip in zip([8, 12, 16, 20], [6, 10, 14, 18]):
+        fingers.append(1 if landmarks[tip].y < landmarks[pip].y else 0)
+    return fingers
+
+def add_rounded_corners(img, radius=30):
+    w, h = img.size
+    circle = Image.new('L', (radius * 2, radius * 2), 0)
+    draw = ImageDraw.Draw(circle)
+    draw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+
+    alpha = Image.new('L', img.size, 255)
+    alpha.paste(circle.crop((0, 0, radius, radius)), (0, 0))
+    alpha.paste(circle.crop((radius, 0, radius * 2, radius)), (w - radius, 0))
+    alpha.paste(circle.crop((0, radius, radius, radius * 2)), (0, h - radius))
+    alpha.paste(circle.crop((radius, radius, radius * 2, radius * 2)), (w - radius, h - radius))
+
+    img.putalpha(alpha)
+    return img
+
+def classify_static_gesture(landmarks):
+    """Determines the ASL letter based on hand landmarks using a soft rule–based classifier."""
+    fingers = get_finger_states(landmarks)
+    def dist(a, b): 
+        return get_distance(a, b)
+    thumb_tip = landmarks[4]
+    index_tip = landmarks[8]
+    middle_tip = landmarks[12]
+    ring_tip = landmarks[16]
+    pinky_tip = landmarks[20]
+
+    if tuple(fingers) == (0, 0, 0, 0, 0):
+        thumb_above_fingers = thumb_tip.y < min(index_tip.y, middle_tip.y, ring_tip.y, pinky_tip.y)
+        thumb_outside = thumb_tip.x < index_tip.x
+        if thumb_above_fingers and thumb_outside:
+            return 'A'
+        
+        if thumb_tip.y > min(index_tip.y, middle_tip.y, ring_tip.y, pinky_tip.y):
+            return 'E'
+        if not landmarks:
+            return False
+
+    # Landmark aliases for readability
+    thumb_tip = landmarks[4]
+    index_tip = landmarks[8]
+    pinky_tip = landmarks[20]
+    
+    # --- Rules for 'C' ---
+
+    # Rule 1: Fingers (Index to Pinky) should be curved/folded.
+    # We check if their tips are lower than their middle joints (PIP).
+    index_folded = landmarks[8].y > landmarks[6].y
+    middle_folded = landmarks[12].y > landmarks[10].y
+    ring_folded = landmarks[16].y > landmarks[14].y
+    pinky_folded = landmarks[20].y > landmarks[18].y
+    
+    all_fingers_folded = index_folded and middle_folded and ring_folded and pinky_folded
+
+    # Rule 2: The thumb should be somewhat extended, not tucked into a fist.
+    # We check that the thumb tip is to the "left" of its base joint (for a right hand).
+    thumb_is_open = landmarks[4].x < landmarks[3].x
+
+    # Rule 3: The hand should form a wide curve.
+    # We check that the thumb and pinky are far apart.
+    # The threshold (0.2) may need tuning based on your hand size and distance from camera.
+    is_curved = get_distance(thumb_tip, pinky_tip) > 0.2
+
+    # A gesture is 'C' if all rules are met.
+    if all_fingers_folded and thumb_is_open and is_curved:
+        return True
+        if dist(thumb_tip, index_tip) < 0.05:
+            return 'S'
+        
+    if tuple(fingers) == (0, 1, 1, 1, 1):
+        return 'B'
+    if fingers == [0, 1, 0, 0, 0]:
+        return 'D'
+    if fingers == [0, 0, 1, 1, 1]:
+        return 'F'
+    
+    if fingers == [0, 0, 0, 0, 0]:
+    # Get Y values early so they're defined
+        thumb_y = thumb_tip.y
+        index_y = index_tip.y
+        middle_y = middle_tip.y
+        ring_y = ring_tip.y
+        pinky_y = pinky_tip.y
+
+        thumb_x = thumb_tip.x
+        middle_x = middle_tip.x
+        ring_x = ring_tip.x
+        pinky_x = pinky_tip.x
+        index_x = index_tip.x
+
+        # --- M: Thumb is above ring and pinky
+        if thumb_y < ring_y and thumb_y < pinky_y:
+            return 'M'
+
+        # --- N: Thumb is above middle and ring
+        elif thumb_y < middle_y and thumb_y < ring_y:
+            return 'N'
+
+        # --- T: Thumb horizontally between index and middle
+        elif index_x < thumb_x < middle_x:
+            return 'T'
+
+
+
+    
+    # Motion-based letters
+    # Track J with pinky
+    pinky_tip = landmarks[20]
+    track_motion('J', (pinky_tip.x, pinky_tip.y))
+
+    if detect_j_motion():
+        motion_history['J'].clear()
+        return 'J'
+
+    # Track Z with index
+    index_tip = landmarks[8]
+    track_motion('Z', (index_tip.x, index_tip.y))
+
+    if detect_z_motion():
+        motion_history['Z'].clear()
+        return 'Z'
+
+
+    index_base = landmarks[5]
+    index_tip = landmarks[8]
+    middle_base = landmarks[9]
+    middle_tip = landmarks[12]
+
+    index_sideways = is_finger_sideways(index_base, index_tip)
+    middle_sideways = is_finger_sideways(middle_base, middle_tip)
+
+    # G: Only index finger sideways
+    if fingers == [1, 1, 0, 0, 0] and index_sideways and not middle_sideways:
+        return 'G'
+
+    # H: Index + middle both sideways
+    if fingers == [1, 1, 1, 0, 0] and index_sideways and middle_sideways:
+        return 'H'
+
+    if fingers == [0, 0, 0, 0, 1]:
+        return 'I'
+    if fingers == [1, 1, 1, 0, 0] and min(index_tip.x, middle_tip.x) < thumb_tip.x < max(index_tip.x, middle_tip.x):
+        return 'K'
+
+    if fingers == [0, 0, 0, 0, 0]:
+        # Get Y positions (lower y means higher on screen)
+        thumb_y = thumb_tip.y
+        pinky_y = pinky_tip.y
+        index_y = index_tip.y
+        middle_y = middle_tip.y
+        ring_y = ring_tip.y
+
+        # M: thumb is over the ring and pinky (covers 3 fingers)
+        if thumb_y < ring_y and thumb_y < pinky_y:
+            return 'M'
+        
+        # N: thumb is over the middle and ring (covers 2 fingers)
+        elif thumb_y > middle_y and thumb_y < ring_y:
+            return 'N'
+
+    if sum(fingers) >= 3 and dist(thumb_tip, index_tip) < 0.07 and dist(thumb_tip, pinky_tip) < 0.15:
+        return 'O'
+    if fingers == [0, 1, 1, 0, 0] and dist(index_tip, middle_tip) < 0.025:
+        return 'R'
+    if fingers == [0, 1, 1, 0, 0] and dist(index_tip, middle_tip) < 0.04:
+        return 'U'
+    if fingers == [0, 1, 1, 0, 0]:
+        if get_distance(index_tip, middle_tip) > 0.05:
+            return 'V'
+        
+    index_base = landmarks[5]
+    index_tip = landmarks[8]
+
+    if fingers == [1, 1, 0, 0, 0] and is_finger_pointing_down(index_base, index_tip):
+        return 'P'
+
+    
+    thumb_tip = landmarks[4]
+    thumb_base = landmarks[2]
+
+    index_tip = landmarks[8]
+    index_base = landmarks[6]
+
+    # Check direction (y-axis grows downwards in image)
+    is_index_down = index_tip.y > index_base.y
+    is_thumb_down = thumb_tip.y > thumb_base.y
+
+    # Finger folding pattern: thumb + index extended, rest folded
+    if fingers == [1, 1, 0, 0, 0] and is_index_down and is_thumb_down:
+        return 'Q'
+    if fingers == [0, 1, 1, 1, 0]:
+        return 'W'
+    if fingers == [0, 1, 0, 0, 0] and index_tip.y > landmarks[6].y:
+        return 'X'
+    if fingers == [1, 0, 0, 0, 1]:
+        return 'Y'
+    if fingers == [1, 1, 0, 0, 0]:
+        return 'L'
+    if tuple(fingers) == (1, 1, 1, 1, 1):
+        return 'Open Palm'
+    return None
+
+
+def classify_with_confidence(landmarks):
+    """
+    Return a sorted list of (label, confidence) pairs.
+    """
+    raw_label = classify_static_gesture(landmarks)
+    all_labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    scores = {}
+    for label in all_labels:
+        scores[label] = 1.0 if label == raw_label else 0.0
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+def update_history():
+    """Update the gesture history textbox with the last few recorded gestures."""
+    history_box.configure(state="normal")
+    history_box.delete("1.0", "end")
+    for gesture in gesture_history[:5]:
+        history_box.insert("end", f"{gesture}\n")
+    history_box.configure(state="disabled")
+
+def clear_output():
+    """Clear gesture history, word stream and reset the display labels."""
+    global prev_spoken, word_stream, gesture_history
+    gesture_history.clear()
+    word_stream = ""
+    prev_spoken = ""
+    gesture_label.configure(text="Waiting for gesture...")
+    icon_label.configure(text="🤟")
+    stream_box.configure(text="")
+    history_box.configure(state="normal")
+    history_box.delete("1.0", "end")
+    history_box.configure(state="disabled")
+    suggestion_box.configure(state="normal")
+    suggestion_box.delete("1.0", "end")
+    suggestion_box.configure(state="disabled")
+
+def toggle_camera():
+    global camera_active
+    camera_active = not camera_active
+    if camera_active:
+        camera_status.configure(text="CAMERA ACTIVE", text_color="#4dff4d")
+        start_button.configure(text="STOP RECOGNITION", fg_color="#ff3333", hover_color="#cc0000")
+    else:
+        camera_status.configure(text="CAMERA INACTIVE", text_color="#ff3333")
+        start_button.configure(text="START RECOGNITION", fg_color="#0066ff", hover_color="#0044cc")
+    update_frame()
+
+def show_instructions():
+    if hasattr(app, 'instruction_window') and app.instruction_window.winfo_exists():
+        app.instruction_window.lift()
+        return
+    
+    app.instruction_window = ctk.CTkToplevel(app)
+    app.instruction_window.title("Sign2SpeechX Instructions")
+    app.instruction_window.geometry("500x500")
+    app.instruction_window.resizable(False, False)
+    
+    # Create a scrollable frame
+    scroll_frame = ctk.CTkScrollableFrame(app.instruction_window)
+    scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    # Title
+    ctk.CTkLabel(scroll_frame, text="📋 Sign2SpeechX Instructions", 
+                font=("Roboto", 18, "bold"), 
+                text_color="#00ccff").pack(pady=(0, 10), anchor="w")
+    
+    # Sections
+    sections = [
+        ("🎯 Getting Started", [
+            "1. Position yourself in front of your camera",
+            "2. Ensure good lighting on your hands",
+            "3. Keep your background clean and uncluttered",
+            "4. Use one hand for best recognition results"
+        ]),
+        ("✋ Gesture Tips", [
+            "• Hold each gesture steady for 1-2 seconds",
+            "• Show letters clearly with your dominant hand",
+            "• Use 'Open Palm' gesture for space between words",
+            "• Avoid fast movements between gestures"
+        ]),
+        ("⚠️ Important Notes", [
+            "• Camera access is required for gesture recognition",
+            "• Application processes video locally (no data sent)",
+            "• Recognition works best with ASL alphabet signs",
+            "• Clear output periodically for best results"
+        ]),
+        ("🔧 Controls", [
+            "START/STOP - Toggle camera recognition",
+            "CLEAR - Reset all output and history",
+            "ASL CHART - Open reference chart in browser",
+            "HOTKEYS - p, h, l, c for quick phrases"
+        ])
+    ]
+    
+    for title, items in sections:
+        ctk.CTkLabel(scroll_frame, text=title, 
+                    font=("Roboto", 14, "bold"), 
+                    text_color="#4dff4d").pack(pady=(10, 5), anchor="w")
+        
+        for item in items:
+            ctk.CTkLabel(scroll_frame, text=item, 
+                        font=("Roboto", 12), 
+                        text_color="#cccccc", 
+                        justify="left", 
+                        anchor="w").pack(pady=2, padx=10, fill="x")
+
+def show_asl_chart():
+    if hasattr(app, 'asl_window') and app.asl_window.winfo_exists():
+        app.asl_window.lift()
+        return
+    
+    app.asl_window = ctk.CTkToplevel(app)
+    app.asl_window.title("ASL Alphabet Reference")
+    app.asl_window.geometry("600x700")
+    app.asl_window.resizable(False, False)
+    
+    # Title
+    ctk.CTkLabel(app.asl_window, text="ASL Alphabet Chart", 
+                font=("Roboto", 20, "bold"), 
+                text_color="#00ccff").pack(pady=10)
+    
+    # Scrollable frame
+    scroll_frame = ctk.CTkScrollableFrame(app.asl_window)
+    scroll_frame.pack(fill="both", expand=True, padx=10, pady=5)
+    
+    # ASL chart content
+    asl_letters = [
+        ("A", "Fist with thumb to the side"),
+        ("B", "Flat hand, fingers together"),
+        ("C", "Curved hand like a 'C' shape"),
+        ("D", "Point with index finger, others in fist"),
+        ("E", "Fingers curled in, thumb across fingers"),
+        ("F", "Thumb and index finger touch, others extended"),
+        ("G", "Point with index finger, thumb under"),
+        ("H", "Point with middle and index fingers, thumb under"),
+        ("I", "Pinky finger up, others in fist"),
+        ("J", "Pinky finger traces a 'J' in air"),
+        ("K", "Middle finger up, index finger bent, thumb under"),
+        ("L", "Thumb and index finger extended at right angles"),
+        ("M", "Three fingers down over thumb"),
+        ("N", "Two fingers down over thumb"),
+        ("O", "All fingers curled to touch thumb"),
+        ("P", "Inverted 'K' shape"),
+        ("Q", "Thumb and index finger down"),
+        ("R", "Crossed middle and index fingers"),
+        ("S", "Fist with thumb over fingers"),
+        ("T", "Fist with thumb between index and middle"),
+        ("U", "Index and middle fingers up together"),
+        ("V", "Index and middle fingers up apart"),
+        ("W", "Middle three fingers up"),
+        ("X", "Index finger bent"),
+        ("Y", "Thumb and pinky extended"),
+        ("Z", "Trace a 'Z' in air with index finger")
+    ]
+    
+    for letter, desc in asl_letters:
+        frame = ctk.CTkFrame(scroll_frame, corner_radius=10, fg_color="#252540")
+        frame.pack(fill="x", pady=2, padx=5)
+        
+        ctk.CTkLabel(frame, text=letter, 
+                    font=("Roboto", 24, "bold"), 
+                    text_color="#00ccff", 
+                    width=50).pack(side="left", padx=10)
+        
+        ctk.CTkLabel(frame, text=desc, 
+                    font=("Roboto", 12), 
+                    text_color="#cccccc").pack(side="left", padx=10, fill="x", expand=True)
+    
+    # Open in browser button
+    ctk.CTkButton(app.asl_window, 
+                 text="Open Detailed ASL Chart in Browser", 
+                 command=lambda: webbrowser.open("https://www.asl-sign-language.com/wp-content/uploads/2019/12/asl-alphabet.jpg"),
+                 fg_color="#0066ff",
+                 hover_color="#0044cc").pack(pady=10)
+
+def on_key_press(event):
+    key = event.char.lower()
+    if key in HOTKEYS:
+        speak(HOTKEYS[key])
+
+# ------------------ FRAME UPDATE (GESTURE PROCESSING) ------------------
+def update_frame():
+    if not camera_active:
+        return
+    
+    success, frame = cap.read()
+    if not success:
+        app.after(20, update_frame)
+        return
+
+    frame = cv2.flip(frame, 1)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(frame_rgb)
+
+    label = "Waiting for gesture..."
+    border_color = "#00ccff"
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            # Get the gesture letter
+            gesture = classify_static_gesture(hand_landmarks.landmark)
+            # Also compute top-3 "confidence" scores (for display in the suggestion box)
+            top3 = classify_with_confidence(hand_landmarks.landmark)[:3]
+            top_label, top_score = top3[0]
+
+            if gesture:
+                # If the detected gesture is "Open Palm", we treat it as a space
+                if gesture == "Open Palm":
+                    speak("Open Palm")
+                else:
+                    speak(gesture)
+                label = gesture
+                icon_label.configure(text=icon_map.get(gesture, "🤟"))
+                stream_box.configure(text=word_stream[-20:])
+                suggestion_box.configure(state="normal")
+                suggestion_box.delete("1.0", "end")
+                for g, s in top3:
+                    suggestion_box.insert("end", f"{g}: {s*100:.0f}% confidence\n")
+                suggestion_box.configure(state="disabled")
+                border_color = "#4dff4d" if top_score >= 0.6 else "#ff3333"
+            break
+    else:
+        label = "Waiting for gesture..."
+        border_color = "#ff3333"
+
+    gesture_label.configure(text=label)
+
+    # Convert the image to a PIL image, resize and add rounded corners before display
+    img = Image.fromarray(frame_rgb)
+    img = img.resize((500, 380))
+    img = add_rounded_corners(img)
+    imgtk = ImageTk.PhotoImage(image=img)
+    webcam_container.configure(border_color=border_color)
+    webcam_label.configure(image=imgtk)
+    webcam_label.image = imgtk
+
+    app.after(20, update_frame)
+
+# ------------------ GUI SETUP ------------------
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+app = ctk.CTk()
+app.title("Sign2SpeechX")
+app.geometry("1200x800")
+app.minsize(1100, 750)
+
+# Configure grid layout
+app.grid_rowconfigure(0, weight=1)
+app.grid_columnconfigure(0, weight=1)
+
+# Main container with space theme
+main_container = ctk.CTkFrame(app, fg_color="#0a0a1a", corner_radius=0)
+main_container.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+main_container.grid_rowconfigure(1, weight=1)
+main_container.grid_columnconfigure(0, weight=1)
+
+# Title bar with branding
+title_bar = ctk.CTkFrame(main_container, fg_color="#000033", height=70, corner_radius=0)
+title_bar.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+title_bar.grid_columnconfigure(0, weight=1)
+
+# App title with techy font
+ctk.CTkLabel(title_bar, 
+            text="SIGN2SPEECHX", 
+            font=("Roboto Mono", 24, "bold"), 
+            text_color="#00ccff").grid(row=0, column=0, padx=20, pady=10, sticky="w")
+
+# Camera status indicator
+camera_status = ctk.CTkLabel(title_bar, 
+                            text="CAMERA INACTIVE", 
+                            font=("Roboto Mono", 14), 
+                            text_color="#ff3333")
+camera_status.grid(row=0, column=1, padx=20, pady=10, sticky="e")
+
+# AI status indicator
+ai_label = ctk.CTkLabel(title_bar, 
+                       text="AI Ready", 
+                       font=("Roboto Mono", 14), 
+                       text_color="#4dff4d")
+ai_label.grid(row=0, column=2, padx=20, pady=10, sticky="e")
+
+# Main content area
+content_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+content_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=20)
+content_frame.grid_rowconfigure(0, weight=1)
+content_frame.grid_columnconfigure(0, weight=1)
+content_frame.grid_columnconfigure(1, weight=1)
+
+# Left panel - Camera feed
+left_panel = ctk.CTkFrame(content_frame, fg_color="transparent")
+left_panel.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+left_panel.grid_rowconfigure(3, weight=1)  # Changed to accommodate warning frame
+left_panel.grid_columnconfigure(0, weight=1)
+
+# Camera container with glowing border
+webcam_container = ctk.CTkFrame(left_panel, 
+                               fg_color="#151530", 
+                               corner_radius=15, 
+                               border_width=2, 
+                               border_color="#00ccff")
+webcam_container.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+webcam_container.grid_rowconfigure(0, weight=1)
+webcam_container.grid_columnconfigure(0, weight=1)
+
+webcam_label = ctk.CTkLabel(webcam_container, text="")
+webcam_label.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+
+# Gesture information below camera
+gesture_info_frame = ctk.CTkFrame(left_panel, fg_color="#151530", corner_radius=15)
+gesture_info_frame.grid(row=1, column=0, sticky="ew", pady=(15, 0))
+
+gesture_label = ctk.CTkLabel(gesture_info_frame, 
+                           text="Waiting for gesture...", 
+                           font=("Roboto Mono", 28), 
+                           text_color="#00ccff",
+                           height=60)
+gesture_label.pack(pady=10)
+
+# Warning frame (added below gesture info)
+warning_frame = ctk.CTkFrame(left_panel, 
+                            fg_color="#1a0a0a",  # Dark red background
+                            corner_radius=10,
+                            border_width=1,
+                            border_color="#ff3333")
+warning_frame.grid(row=2, column=0, sticky="ew", pady=(15, 0))
+
+warning_icon = ctk.CTkLabel(warning_frame, 
+                           text="⚠️", 
+                           font=("Segoe UI Emoji", 20),
+                           text_color="#ff6666",
+                           width=30)
+warning_icon.pack(side="left", padx=(10, 5), pady=5)
+
+warning_text = ctk.CTkLabel(warning_frame,
+                           text="Camera is active when recognition is on. "
+                                "Ensure you're in a private space and close the app when not in use.",
+                           font=("Roboto", 12),
+                           text_color="#ff9999",
+                           wraplength=450,
+                           justify="left")
+warning_text.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=5)
+
+# Right panel - Controls and info
+right_panel = ctk.CTkFrame(content_frame, fg_color="transparent")
+right_panel.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+right_panel.grid_rowconfigure(3, weight=1)
+right_panel.grid_columnconfigure(0, weight=1)
+
+# Current gesture display
+gesture_display_frame = ctk.CTkFrame(right_panel, fg_color="#151530", corner_radius=15)
+gesture_display_frame.grid(row=0, column=0, sticky="ew", pady=(0, 15))
+
+icon_label = ctk.CTkLabel(gesture_display_frame, 
+                         text="🤟", 
+                         font=("Segoe UI Emoji", 64), 
+                         text_color="#00ccff")
+icon_label.pack(pady=10)
+
+# Text stream display
+stream_frame = ctk.CTkFrame(right_panel, fg_color="#151530", corner_radius=15, height=80)
+stream_frame.grid(row=1, column=0, sticky="ew", pady=(0, 15))
+
+stream_box = ctk.CTkLabel(stream_frame, 
+                         text="", 
+                         font=("Roboto Mono", 24), 
+                         text_color="#ffffff",
+                         height=80)
+stream_box.pack(fill="both", expand=True, padx=10, pady=10)
+
+# History and suggestions
+history_suggestion_frame = ctk.CTkFrame(right_panel, fg_color="transparent")
+history_suggestion_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+history_suggestion_frame.grid_rowconfigure(0, weight=1)
+history_suggestion_frame.grid_columnconfigure(0, weight=1)
+history_suggestion_frame.grid_columnconfigure(1, weight=1)
+
+# Gesture history
+history_frame = ctk.CTkFrame(history_suggestion_frame, fg_color="#151530", corner_radius=15)
+history_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+history_frame.grid_rowconfigure(1, weight=1)
+history_frame.grid_columnconfigure(0, weight=1)
+
+ctk.CTkLabel(history_frame, 
+            text="RECENT GESTURES", 
+            font=("Roboto Mono", 12, "bold"), 
+            text_color="#00ccff").grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+
+history_box = ctk.CTkTextbox(history_frame, 
+                            font=("Roboto Mono", 14), 
+                            fg_color="#0a0a20", 
+                            text_color="#dddddd", 
+                            wrap="word", 
+                            corner_radius=10)
+history_box.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+history_box.configure(state="disabled")
+
+# Suggestions
+suggestion_frame = ctk.CTkFrame(history_suggestion_frame, fg_color="#151530", corner_radius=15)
+suggestion_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+suggestion_frame.grid_rowconfigure(1, weight=1)
+suggestion_frame.grid_columnconfigure(0, weight=1)
+
+ctk.CTkLabel(suggestion_frame, 
+            text="DETECTION CONFIDENCE", 
+            font=("Roboto Mono", 12, "bold"), 
+            text_color="#00ccff").grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+
+suggestion_box = ctk.CTkTextbox(suggestion_frame, 
+                              font=("Roboto Mono", 14), 
+                              fg_color="#0a0a20", 
+                              text_color="#dddddd", 
+                              wrap="word", 
+                              corner_radius=10)
+suggestion_box.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+suggestion_box.configure(state="disabled")
+
+# Buttons panel
+buttons_frame = ctk.CTkFrame(right_panel, fg_color="transparent")
+buttons_frame.grid(row=3, column=0, sticky="sew", pady=(0, 0))
+buttons_frame.grid_columnconfigure(0, weight=1)
+buttons_frame.grid_columnconfigure(1, weight=1)
+buttons_frame.grid_columnconfigure(2, weight=1)
+
+# Premium button style parameters
+button_height = 55
+button_font = ("Roboto", 15, "bold")
+button_corner_radius = 8
+
+# Action buttons with premium styling
+start_button = ctk.CTkButton(buttons_frame, 
+                           text="START RECOGNITION", 
+                           font=button_font, 
+                           corner_radius=button_corner_radius, 
+                           fg_color="#0066ff", 
+                           hover_color="#0055dd", 
+                           text_color="#ffffff", 
+                           height=button_height, 
+                           border_width=0,
+                           command=toggle_camera)
+start_button.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
+
+clear_button = ctk.CTkButton(buttons_frame, 
+                           text="CLEAR", 
+                           font=button_font, 
+                           corner_radius=button_corner_radius, 
+                           fg_color="#444455", 
+                           hover_color="#333344", 
+                           text_color="#ffffff", 
+                           height=button_height, 
+                           border_width=0,
+                           command=clear_output)
+clear_button.grid(row=0, column=1, padx=10, pady=0, sticky="ew")
+
+instructions_button = ctk.CTkButton(buttons_frame, 
+                                  text="INSTRUCTIONS", 
+                                  font=button_font, 
+                                  corner_radius=button_corner_radius, 
+                                  fg_color="#6600cc", 
+                                  hover_color="#5500bb", 
+                                  text_color="#ffffff", 
+                                  height=button_height, 
+                                  border_width=0,
+                                  command=show_instructions)
+instructions_button.grid(row=0, column=2, padx=(10, 0), pady=0, sticky="ew")
+
+asl_button = ctk.CTkButton(buttons_frame, 
+                          text="ASL CHART", 
+                          font=button_font, 
+                          corner_radius=button_corner_radius, 
+                          fg_color="#006633", 
+                          hover_color="#005522", 
+                          text_color="#ffffff", 
+                          height=button_height, 
+                          border_width=0,
+                          command=show_asl_chart)
+asl_button.grid(row=1, column=0, columnspan=3, pady=(10, 0), sticky="ew")
+
+# Footer
+footer_frame = ctk.CTkFrame(main_container, fg_color="transparent", height=40)
+footer_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
+footer_frame.grid_columnconfigure(0, weight=1)
+
+# Copyright notice
+copyright_label = ctk.CTkLabel(footer_frame,
+                             text="© Made with Love by Oink",
+                             font=("Roboto", 10),
+                             text_color="#666699")
+copyright_label.grid(row=0, column=0, sticky="e")
+
+# Bind hotkeys
+app.bind("<KeyPress>", on_key_press)
+
+# ------------------ START THE APP ------------------
+app.mainloop()
+cap.release()
+cv2.destroyAllWindows()
